@@ -1,5 +1,5 @@
 import { spawnJsonLines } from './spawn.ts';
-import { RETURN_FORMAT, type WorkerResult, type WorkerRunInput } from './types.ts';
+import { RETURN_FORMAT, SKILL_PREFIX, skillFromPath, type WorkerResult, type WorkerRunInput } from './types.ts';
 
 export async function runCodex(bin: string, effort: 'low' | 'medium' | 'high', i: WorkerRunInput): Promise<WorkerResult> {
   const common = ['--json', '--skip-git-repo-check', '-c', `model_reasoning_effort="${effort}"`];
@@ -19,7 +19,10 @@ export async function runCodex(bin: string, effort: 'low' | 'medium' | 'high', i
       else if (e.type === 'item.completed' || e.type === 'item.started') {
         const it = e.item ?? {};
         if (it.type === 'agent_message' && e.type === 'item.completed') { last = it.text ?? ''; i.onText(last); }
-        else if (it.type === 'command_execution' && e.type === 'item.started') i.onTool(`$ ${it.command ?? ''}`);
+        else if (it.type === 'command_execution' && e.type === 'item.started') {
+          const sk = skillFromPath(String(it.command ?? ''));
+          i.onTool(sk ? SKILL_PREFIX + sk : `$ ${it.command ?? ''}`);
+        }
         else if (it.type === 'file_change' && e.type === 'item.completed') i.onTool(`edit ${(it.changes ?? []).map((c: any) => c.path).join(', ')}`);
         else if (it.type === 'reasoning' && it.text) i.onText(it.text);
       } else if (e.type === 'turn.completed') tokens = (e.usage?.input_tokens ?? 0) + (e.usage?.output_tokens ?? 0);

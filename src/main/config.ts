@@ -15,6 +15,8 @@ function defaults(): CouncilConfig {
     currentFolder: null,
     chairModel: 'opus',
     chairEffort: 'medium',
+    pipeline: true,
+    handoffAtPct: 20,
     workerTimeoutMin: 10,
     // read-only by default; add build/test commands here to let Antigravity run them
     agyAllowCommands: ['cat', 'type', 'head', 'tail', 'ls', 'dir', 'Get-Content', 'Get-ChildItem', 'rg', 'grep', 'findstr', 'git status', 'git diff', 'git log', 'git show'],
@@ -35,7 +37,7 @@ export function loadConfig(): CouncilConfig {
     for (const k of Object.keys(bins) as (keyof typeof bins)[]) {
       if (saved.bins?.[k] && existsSync(saved.bins[k])) bins[k] = saved.bins[k];
     }
-    cache = { ...d, ...saved, bins };
+    cache = { ...d, ...saved, pipeline: saved.pipeline ?? d.pipeline, handoffAtPct: saved.handoffAtPct ?? d.handoffAtPct, bins };
   } catch {
     cache = d;
   }

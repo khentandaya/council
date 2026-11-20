@@ -22,4 +22,4 @@ await runChair(prompt, null, {
     if (e.kind === 'worker_text') return; // too chatty for a terminal
     console.log(`${s}s ${e.agent.padEnd(11)} ${tag.padEnd(20)} ${text}${e.model && e.text ? `  [${e.model}]` : ''}`);
   },
-});
+}).catch((err) => { console.error(`run failed: ${String(err?.message ?? err).split('\n')[0]}`); process.exitCode = 1; });

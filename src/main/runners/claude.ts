@@ -1,6 +1,6 @@
 import { query } from '@anthropic-ai/claude-agent-sdk';
 import { cleanEnv } from '../env.ts';
-import { RETURN_FORMAT, type WorkerResult, type WorkerRunInput } from './types.ts';
+import { RETURN_FORMAT, SKILL_PREFIX, type WorkerResult, type WorkerRunInput } from './types.ts';
 
 /** A separate Claude (haiku / sonnet / opus) doing a delegated task with its own context. */
 export async function runClaudeWorker(bin: string, configDir: string, model: string, i: WorkerRunInput): Promise<WorkerResult> {
@@ -18,6 +18,7 @@ export async function runClaudeWorker(bin: string, configDir: string, model: str
       prompt: i.task + RETURN_FORMAT,
       options: {
         cwd: i.cwd,
+        settingSources: ['project', 'local'],
         model,
         resume: i.resume,
         pathToClaudeCodeExecutable: bin || undefined,
@@ -34,7 +35,7 @@ export async function runClaudeWorker(bin: string, configDir: string, model: str
       else if (m.type === 'assistant' && !m.parent_tool_use_id) {
         for (const b of m.message.content) {
           if (b.type === 'text' && b.text.trim()) i.onText(b.text);
-          else if (b.type === 'tool_use') i.onTool(b.name);
+          else if (b.type === 'tool_use') i.onTool(b.name === 'Skill' ? SKILL_PREFIX + String((b.input as any)?.skill ?? (b.input as any)?.name ?? 'unknown') : b.name);
         }
       } else if (m.type === 'result') {
         costUsd = m.total_cost_usd;

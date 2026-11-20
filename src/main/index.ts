@@ -3,8 +3,10 @@ import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { Bus } from './bus.ts';
 import { runChair } from './chair.ts';
+import { allUsage, sessionContext } from './usage.ts';
 import { activeProfile, loadConfig, saveConfig } from './config.ts';
-import { accountSummaries, configuredConnections, createProfile, folderSessions, knownFolders, openSignIn, sessionTranscript } from './sessions.ts';
+import { accountSummaries, configuredConnections, createProfile, folderSessions, knownFolders, openSignIn, sessionContextPct, sessionTranscript } from './sessions.ts';
+import { folderWorkerSessions, readWorkerHandoff } from './workers.ts';
 import type { Connection, CouncilConfig, CouncilEvent } from '../shared/types.ts';
 
 const here = fileURLToPath(new URL('.', import.meta.url));
@@ -87,6 +89,14 @@ ipcMain.handle('sessions:load', async (_e, id: string) => {
   const c = loadConfig();
   return c.currentFolder ? sessionTranscript(activeProfile(c), c.currentFolder, id).catch(() => []) : [];
 });
+ipcMain.handle('workers:list', () => {
+  const { currentFolder } = loadConfig();
+  return currentFolder ? folderWorkerSessions(currentFolder) : [];
+});
+ipcMain.handle('workers:handoff', (_e, id: string) => {
+  const { currentFolder } = loadConfig();
+  return currentFolder && typeof id === 'string' ? readWorkerHandoff(currentFolder, id).catch(() => null) : null;
+});
 ipcMain.handle('accounts:list', () => accountSummaries(loadConfig()));
 ipcMain.handle('accounts:signin', (_e, id: string) => {
   const c = loadConfig();
@@ -109,23 +119,45 @@ ipcMain.handle('connections:list', () => {
 ipcMain.handle('run:start', (_e, prompt: string, resume: string | null) => {
   if (current) throw new Error('A run is already in progress.');
   const config = loadConfig();
-  if (!config.currentFolder) throw new Error('Pick a workspace folder first.');
+  const cwd = config.currentFolder;
+  if (!cwd) throw new Error('Pick a workspace folder first.');
+  const profile = activeProfile(config);
   const runId = `${new Date().toISOString().replace(/[:.]/g, '-')}`;
   const ac = new AbortController();
   current = { runId, ac };
   updateTray();
   const emit = (e: Omit<CouncilEvent, 'seq' | 'ts' | 'runId'>) => bus.emit(runId, e);
-  emit({ kind: 'run_start', agent: 'chair', text: prompt, data: { resume, folder: config.currentFolder, profile: config.activeProfileId } });
-  runChair(prompt, resume, {
-    config, profile: activeProfile(config), cwd: config.currentFolder, emit, signal: ac.signal,
-    askPermission: (req) => new Promise((resolve) => {
-      pendingPermissions.set(req.id, resolve);
-      ac.signal.addEventListener('abort', () => resolve({ allow: false, always: false }), { once: true });
-    }),
-  })
+  emit({ kind: 'run_start', agent: 'chair', text: prompt, data: { resume, folder: cwd, profile: config.activeProfileId } });
+  const start = async () => {
+    const pct = resume ? sessionContextPct(profile, cwd, resume) : undefined;
+    if (resume && pct !== undefined && pct >= config.handoffAtPct) {
+      const transcript = await sessionTranscript(profile, cwd, resume).catch(() => []);
+      ac.signal.throwIfAborted();
+      if (transcript?.length) {
+        const lastRequest = transcript.findLast((m) => m.role === 'user')?.text.split('\n\nNew request: ').at(-1)?.slice(0, 2_000) ?? '';
+        const lastAnswer = transcript.findLast((m) => m.role === 'assistant')?.text.slice(0, 6_000) ?? '';
+        prompt = `Handoff from your previous session (it was ${pct}% full, so this is a fresh session):\nLast request: ${lastRequest}\nYour last answer: ${lastAnswer}\n\nNew request: ${prompt}`;
+        resume = null;
+        emit({ kind: 'chair_tool', agent: 'chair', text: `Started a fresh session from a handoff (previous one was ${pct}% full)` });
+      }
+    }
+    return runChair(prompt, resume, {
+      config, profile, cwd, emit, signal: ac.signal,
+      askPermission: (req) => new Promise((resolve) => {
+        pendingPermissions.set(req.id, resolve);
+        ac.signal.addEventListener('abort', () => resolve({ allow: false, always: false }), { once: true });
+      }),
+    });
+  };
+  start()
     .catch((err) => emit({ kind: 'run_error', agent: 'chair', text: ac.signal.aborted ? 'Stopped.' : String(err?.message ?? err) }))
     .finally(() => { current = null; busyTasks.clear(); pendingPermissions.clear(); updateTray(); });
   return { runId };
+});
+ipcMain.handle('usage:get', (_e, force?: boolean) => { const c = loadConfig(); return allUsage(c.bins.claude, activeProfile(c), !!force); });
+ipcMain.handle('sessions:context', (_e, id: string) => {
+  const c = loadConfig();
+  return c.currentFolder ? sessionContext(c.bins.claude, activeProfile(c), c.currentFolder, id) : null;
 });
 ipcMain.handle('run:stop', () => { current?.ac.abort(); });
 ipcMain.handle('permission:answer', (_e, id: string, allow: boolean, always: boolean) => {

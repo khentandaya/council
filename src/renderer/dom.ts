@@ -66,9 +66,17 @@ export function popover(anchor: HTMLElement, content: HTMLElement, align: 'left'
   root.replaceChildren();
   const r = anchor.getBoundingClientRect();
   const pop = h('div', { class: 'popover', role: 'menu' }, content);
-  pop.style.top = `${r.bottom + 6}px`;
-  if (align === 'left') pop.style.left = `${r.left}px`; else pop.style.right = `${window.innerWidth - r.right}px`;
   root.append(pop);
+  // open below the anchor; flip above when the window has no room (the prompt bar sits at the bottom)
+  const ph = pop.offsetHeight, pw = pop.offsetWidth, m = 8;
+  const below = window.innerHeight - r.bottom - m, above = r.top - m;
+  const up = ph + 6 > below && above > below;
+  pop.style.maxHeight = `${Math.max(160, (up ? above : below) - 6)}px`;
+  pop.style.overflowY = 'auto';
+  if (up) { pop.style.bottom = `${window.innerHeight - r.top + 6}px`; pop.classList.add('up'); }
+  else pop.style.top = `${r.bottom + 6}px`;
+  const left = align === 'left' ? r.left : r.right - pw;
+  pop.style.left = `${Math.min(Math.max(m, left), window.innerWidth - pw - m)}px`;
   const close = (e?: Event) => {
     if (e && (pop.contains(e.target as Node) || anchor.contains(e.target as Node))) return;
     pop.remove();

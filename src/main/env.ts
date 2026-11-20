@@ -35,9 +35,26 @@ export function cleanEnv(extra: Record<string, string | undefined> = {}): Record
   return out;
 }
 
+/** Codex's npm wrapper (bin/codex.js) spawns the native codex.exe without windowsHide.
+ *  Under Electron the wrapper has no console, so Windows opens a new terminal window
+ *  for codex.exe on every task. Launching codex.exe ourselves keeps it hidden. */
+function codexNative(bin: string): { exe: string; env: Record<string, string> } | null {
+  if (process.platform !== 'win32' || !/[\\/]@openai[\\/]codex[\\/]bin[\\/]codex\.js$/i.test(bin)) return null;
+  const root = join(bin, '..', '..');
+  const triple = process.arch === 'arm64' ? 'aarch64-pc-windows-msvc' : 'x86_64-pc-windows-msvc';
+  const pkg = process.arch === 'arm64' ? 'codex-win32-arm64' : 'codex-win32-x64';
+  const exe = [join(root, 'node_modules', '@openai', pkg, 'vendor', triple, 'bin', 'codex.exe'),
+    join(root, '..', pkg, 'vendor', triple, 'bin', 'codex.exe'),
+    join(root, 'vendor', triple, 'bin', 'codex.exe')].find((p) => existsSync(p));
+  // the same variables the wrapper sets, so codex still knows npm manages it
+  return exe ? { exe, env: { CODEX_MANAGED_BY_NPM: '1', CODEX_MANAGED_PACKAGE_ROOT: root } } : null;
+}
+
 /** How to launch a binary: .js entry points run under this process's Node
  *  (Electron with ELECTRON_RUN_AS_NODE, or plain node in the harness). */
 export function launchSpec(bin: string, args: string[]): { cmd: string; args: string[]; env: Record<string, string> } {
+  const native = codexNative(bin);
+  if (native) return { cmd: native.exe, args, env: native.env };
   if (bin.endsWith('.js')) {
     const env: Record<string, string> = process.versions.electron ? { ELECTRON_RUN_AS_NODE: '1' } : {};
     return { cmd: process.execPath, args: [bin, ...args], env };

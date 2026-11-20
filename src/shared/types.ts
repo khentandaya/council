@@ -18,8 +18,28 @@ export type EventKind =
   | 'review'         // chair judged a returned task
   | 'permission'     // chair needs the user to approve a tool call
   | 'permission_resolved'
+  | 'plan'           // the chair submitted or revised its plan (data.steps)
+  | 'skill'          // the chair or a worker loaded a skill (text = skill name)
+  | 'context'        // live estimate of the chair session's context use
   | 'run_done'       // chair produced its final answer
   | 'run_error';
+
+/** One plan-limit window. usedPct is 0-100; resetsAt is epoch ms. */
+export interface UsageWindow { usedPct: number; resetsAt: number | null }
+
+/** Plan usage for one agent's account. available=false means the CLI does not report it. */
+export interface AgentUsage {
+  agent: 'claude' | 'codex' | 'antigravity';
+  available: boolean;
+  fiveHour?: UsageWindow;
+  weekly?: UsageWindow;
+  plan?: string;
+  /** why the numbers are missing, or where they came from */
+  note?: string;
+  fetchedAt: number;
+}
+
+export interface ContextInfo { percentage: number; totalTokens: number; maxTokens: number; model: string }
 
 export interface CouncilEvent {
   seq: number;
@@ -50,6 +70,8 @@ export interface CouncilConfig {
   currentFolder: string | null;
   chairModel: string;   // alias or full id
   chairEffort: 'low' | 'medium' | 'high' | 'xhigh' | 'max';
+  pipeline: boolean;
+  handoffAtPct: number;
   workerTimeoutMin: number;
   /** command prefixes Antigravity may run headless, e.g. "git status", "npm test" */
   agyAllowCommands: string[];
@@ -68,6 +90,21 @@ export interface SessionSummary {
   title: string;
   lastModified: number;
   gitBranch?: string;
+  /** estimated % of the context window the session is using */
+  contextPct?: number;
+}
+
+export interface WorkerSession {
+  sessionId: string;
+  agent: WorkerId;
+  taskId: string;
+  model: string;
+  tier: Tier;
+  chairSessionId?: string;
+  folder: string;
+  handoffPath: string;
+  ts: number;
+  ok: boolean;
 }
 
 export interface Connection {
@@ -89,6 +126,8 @@ export interface CouncilApi {
   setConfig(patch: Partial<CouncilConfig>): Promise<CouncilConfig>;
   pickFolder(): Promise<string | null>;
   listSessions(): Promise<SessionSummary[]>;
+  listWorkerSessions(): Promise<WorkerSession[]>;
+  loadWorkerHandoff(sessionId: string): Promise<string | null>;
   accounts(): Promise<AccountSummary[]>;
   signIn(profileId: string): Promise<void>;
   addProfile(name: string): Promise<CouncilConfig>;
@@ -97,6 +136,8 @@ export interface CouncilApi {
   stop(): Promise<void>;
   answerPermission(id: string, allow: boolean, always: boolean): Promise<void>;
   loadSession(sessionId: string): Promise<{ role: 'user' | 'assistant'; text: string }[]>;
+  usage(force?: boolean): Promise<AgentUsage[]>;
+  sessionContext(sessionId: string): Promise<ContextInfo | null>;
   window(action: 'min' | 'max' | 'close'): void;
   onEvent(cb: (e: CouncilEvent) => void): () => void;
 }

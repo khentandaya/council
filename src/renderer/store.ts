@@ -1,4 +1,4 @@
-import type { AccountSummary, AgentId, Connection, CouncilConfig, CouncilEvent, PermissionRequest, SessionSummary, Tier, Verdict, WorkerId } from '../shared/types.ts';
+import type { AccountSummary, AgentId, AgentUsage, Connection, CouncilConfig, CouncilEvent, PermissionRequest, SessionSummary, Tier, Verdict, WorkerId, WorkerSession } from '../shared/types.ts';
 
 export type TaskStatus = 'working' | 'returned' | 'failed' | Verdict;
 
@@ -22,7 +22,14 @@ export interface Task {
   secs?: number;
   tokens?: number;
   costUsd?: number;
+  /** skills this worker loaded */
+  skills: string[];
+  /** the plan step this task carries out */
+  step?: string;
 }
+
+export interface PlanStep { id: string; goal: string; agent: WorkerId; tier: Tier; why: string; write: boolean; depends_on?: string[] }
+export interface Plan { rev: number; summary: string; steps: PlanStep[]; ts: number }
 
 export type Entry =
   | { kind: 'user'; text: string; ts: number }
@@ -34,9 +41,11 @@ export type Entry =
   | { kind: 'review'; taskId: string; verdict: Verdict; text: string; ts: number }
   | { kind: 'final'; text: string; costUsd?: number; ms?: number; ts: number }
   | { kind: 'error'; text: string; ts: number }
-  | { kind: 'notice'; text: string; ts: number };
+  | { kind: 'notice'; text: string; ts: number }
+  | { kind: 'skill'; agent: AgentId; name: string; taskId?: string; ts: number }
+  | { kind: 'plan'; plan: Plan; ts: number };
 
-export type ChairState = 'idle' | 'thinking' | 'writing' | 'waiting' | 'reviewing';
+export type ChairState = 'idle' | 'planning' | 'thinking' | 'writing' | 'waiting' | 'reviewing';
 
 export interface Spend { tasks: number; done: number; redo: number; tokens: number; costUsd: number }
 
@@ -44,6 +53,7 @@ export interface State {
   config: CouncilConfig | null;
   accounts: AccountSummary[];
   sessions: SessionSummary[];
+  workerSessions: WorkerSession[];
   connections: Connection[];
   resumeId: string | null;
   sessionTitle: string | null;
@@ -56,24 +66,31 @@ export interface State {
   tasks: Map<string, Task>;
   permissions: PermissionRequest[];
   spend: Record<AgentId, Spend>;
-  drawerTab: 'transcript' | 'tasks';
+  drawerTab: 'transcript' | 'tasks' | 'handoff';
+  workerHandoff: { session: WorkerSession; output?: string | null } | null;
   focusAgent: WorkerId | null;
+  usage: AgentUsage[];
+  /** the chair's current plan for this run */
+  plan: Plan | null;
+  /** chair session context: exact after a fetch, a live estimate mid-run */
+  context: { pct: number | null; tokens: number; max: number | null; model?: string; exact: boolean; loading?: boolean } | null;
 }
 
 const zeroSpend = (): Spend => ({ tasks: 0, done: 0, redo: 0, tokens: 0, costUsd: 0 });
 
 export const state: State = {
-  config: null, accounts: [], sessions: [], connections: [],
+  config: null, accounts: [], sessions: [], workerSessions: [], connections: [],
   resumeId: null, sessionTitle: null,
   running: false, runId: null, runStartedAt: null,
   chair: 'idle', chairModel: null,
   entries: [], tasks: new Map(), permissions: [],
   spend: { chair: zeroSpend(), codex: zeroSpend(), antigravity: zeroSpend(), claude: zeroSpend() },
-  drawerTab: 'transcript', focusAgent: null,
+  drawerTab: 'transcript', workerHandoff: null, focusAgent: null,
+  usage: [], context: null, plan: null,
 };
 
 type Listener = (topic: Topic) => void;
-export type Topic = 'config' | 'accounts' | 'sessions' | 'connections' | 'run' | 'entries' | 'tasks' | 'permissions' | 'spend' | 'drawer';
+export type Topic = 'config' | 'accounts' | 'sessions' | 'connections' | 'run' | 'entries' | 'tasks' | 'permissions' | 'spend' | 'drawer' | 'usage' | 'context';
 const listeners = new Set<Listener>();
 export const subscribe = (l: Listener) => { listeners.add(l); return () => listeners.delete(l); };
 
@@ -91,18 +108,30 @@ export function notify(...topics: Topic[]) {
   });
 }
 
+/** Context window by model, used until an exact reading arrives. Current Claude models default to 1M. */
+export function windowFor(model: string): number | null {
+  if (/\[1m\]/i.test(model) || /claude-(opus|sonnet|haiku|fable|mythos)-5/.test(model)) return 1_000_000;
+  return model ? 200_000 : null;
+}
+
 export function resetConversation() {
+  if (state.workerHandoff) {
+    state.workerHandoff = null;
+    if (state.drawerTab === 'handoff') state.drawerTab = 'transcript';
+    notify('drawer');
+  }
   state.entries = [];
   state.tasks = new Map();
   state.spend = { chair: zeroSpend(), codex: zeroSpend(), antigravity: zeroSpend(), claude: zeroSpend() };
-  notify('entries', 'tasks', 'spend');
+  state.context = null;
+  notify('entries', 'tasks', 'spend', 'context');
 }
 
 export function apply(e: CouncilEvent) {
   const ts = e.ts;
   switch (e.kind) {
     case 'run_start':
-      state.running = true; state.runId = e.runId; state.runStartedAt = ts; state.chair = 'thinking';
+      state.running = true; state.runId = e.runId; state.runStartedAt = ts; state.chair = 'planning'; state.plan = null;
       state.entries.push({ kind: 'user', text: e.text ?? '', ts });
       notify('run', 'entries');
       break;
@@ -119,14 +148,14 @@ export function apply(e: CouncilEvent) {
       notify('run', 'entries');
       break;
     case 'chair_tool':
-      state.chair = 'thinking';
+      state.chair = state.plan ? 'thinking' : 'planning';
       state.entries.push({ kind: 'tool', text: e.text ?? '', ts });
       notify('run', 'entries');
       break;
     case 'dispatch': {
       const t: Task = {
         id: e.taskId!, runId: e.runId, agent: e.agent as WorkerId, tier: e.tier ?? 0, model: e.model ?? '',
-        brief: e.text ?? '', write: !!e.data?.write, checks: (e.data?.crossCheckOf as string | null) ?? undefined, status: 'working', live: '', lastTool: '', output: '', startedAt: ts,
+        brief: e.text ?? '', write: !!e.data?.write, step: (e.data?.step as string | null) ?? undefined, checks: (e.data?.crossCheckOf as string | null) ?? undefined, status: 'working', live: '', lastTool: '', output: '', startedAt: ts, skills: [],
       };
       state.tasks.set(t.id, t);
       state.spend[t.agent].tasks++;
@@ -184,6 +213,30 @@ export function apply(e: CouncilEvent) {
       state.permissions = state.permissions.filter((p) => p.id !== e.data?.id);
       notify('permissions');
       break;
+    case 'plan': {
+      const plan: Plan = { rev: Number(e.data?.rev ?? 1), summary: e.text ?? '', steps: (e.data?.steps as PlanStep[]) ?? [], ts };
+      state.plan = plan;
+      state.chair = 'thinking';
+      state.entries.push({ kind: 'plan', plan, ts });
+      notify('run', 'entries', 'tasks');
+      break;
+    }
+    case 'skill': {
+      const name = e.text ?? 'unknown';
+      const t = e.taskId ? state.tasks.get(e.taskId) : undefined;
+      if (t && !t.skills.includes(name)) t.skills.push(name);
+      state.entries.push({ kind: 'skill', agent: e.agent, name, taskId: e.taskId, ts });
+      notify('entries', 'tasks');
+      break;
+    }
+    case 'context': {
+      const tokens = Number(e.data?.tokens ?? 0);
+      const prev = state.context;
+      const max = prev?.max && (!prev.model || !e.model || prev.model === e.model) ? prev.max : windowFor(e.model ?? '');
+      state.context = { tokens, max, pct: max ? Math.min(100, Math.round((tokens / max) * 100)) : null, model: e.model, exact: false };
+      notify('context');
+      break;
+    }
     case 'run_done':
       state.running = false; state.chair = 'idle';
       state.spend.chair.costUsd += (e.data?.costUsd as number) ?? 0;

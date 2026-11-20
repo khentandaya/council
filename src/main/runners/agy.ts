@@ -2,7 +2,7 @@ import { mkdirSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { DATA_DIR } from '../config.ts';
 import { spawnJsonLines } from './spawn.ts';
-import { RETURN_FORMAT, type WorkerResult, type WorkerRunInput } from './types.ts';
+import { RETURN_FORMAT, SKILL_PREFIX, skillFromPath, type WorkerResult, type WorkerRunInput } from './types.ts';
 
 /** Headless agy can't ask for approval, so anything not pre-allowed is denied.
  *  Rules are prefix matches: command(git status) allows `git status ...`. */
@@ -40,6 +40,8 @@ export async function runAgy(bin: string, model: string, allowCommands: string[]
         const s = e.step_update ?? {};
         if (s.step_type === 'agent_response' && s.text_delta) { text += s.text_delta; i.onText(text); }
         else if (s.state === 'ACTIVE' && s.step_type && s.step_type !== 'agent_response' && s.step_type !== 'user_input') {
+          const sk = skillFromPath(JSON.stringify(s));
+          if (sk) { i.onTool(SKILL_PREFIX + sk); return; }
           i.onTool(String(s.tool_name ?? s.step_type).replace(/_/g, ' '));
         }
       } else if (e.event === 'result') {

@@ -1,4 +1,4 @@
-import type { CouncilEvent, Tier, Verdict, WorkerId } from '../../shared/types.ts';
+import type { AgentUsage, CouncilEvent, Tier, Verdict, WorkerId } from '../../shared/types.ts';
 import {
   CHAIR_FRONT, CHAIR_FRONT_READ, CHAIR_FRONT_TYPE, personPal, SEATED_BACK, SEATED_BACK_TYPE, sprite,
   STAMP_ACCEPT, STAMP_ESCALATE, STAMP_REDO, WALK_A, WALK_B,
@@ -32,11 +32,35 @@ export const deskX = (a: WorkerId, tier: Tier) => ROOMS[a].x + 6 + tier * 30;   
 const DESK_Y = 166;
 const WALK_Y = 200;
 
+// ------------------------------------------------------------------ usage tanks
+export type TankRoom = 'chair' | WorkerId;
+interface TankSpot { room: TankRoom; x: number; y: number }
+export const TANK_W = 7, TANK_H = 24, TANK_GAP = 10;
+/** the Claude rooms share one account, so both read the Claude plan */
+export const TANK_SOURCE: Record<TankRoom, AgentUsage['agent']> = { chair: 'claude', codex: 'codex', antigravity: 'antigravity', claude: 'claude' };
+export const TANKS: TankSpot[] = [
+  { room: 'chair', x: 233, y: 80 },
+  ...(['codex', 'antigravity', 'claude'] as WorkerId[]).map((a) => ({ room: a, x: ROOMS[a].x + 91, y: ROOMS[a].y + 92 })),
+];
+
+/** 3x5 pixel font for the tank readouts, so they scale with the office and stay crisp. */
+const FONT: Record<string, string> = {
+  '0': '111101101101111', '1': '010110010010111', '2': '111001111100111', '3': '111001111001111', '4': '101101111001001',
+  '5': '111100111001111', '6': '111100111101111', '7': '111001010010010', '8': '111101111101111', '9': '111101111001111',
+  H: '101101111101101', W: '101101101111101', K: '101110100110101', '?': '111001011000010',
+};
+function glyphs(g: CanvasRenderingContext2D, text: string, x: number, y: number, color: string) {
+  g.fillStyle = 'rgba(0,0,0,0.55)';
+  [...text].forEach((ch, i) => { const f = FONT[ch]; if (f) for (let p = 0; p < 15; p++) if (f[p] === '1') g.fillRect(x + i * 4 + (p % 3), y + Math.floor(p / 3) + 1, 1, 1); });
+  g.fillStyle = color;
+  [...text].forEach((ch, i) => { const f = FONT[ch]; if (f) for (let p = 0; p < 15; p++) if (f[p] === '1') g.fillRect(x + i * 4 + (p % 3), y + Math.floor(p / 3), 1, 1); });
+}
+
 // ------------------------------------------------------------------ state
 type DeskState = 'idle' | 'working' | 'away';
 interface Desk { agent: WorkerId; tier: Tier; state: DeskState; taskId?: string; queue: string[]; model?: string; personIdx: number }
 interface Walker { kind: 'courier' | 'worker'; path: [number, number][]; seg: number; t: number; speed: number; carry?: string; pal: ReturnType<typeof personPal>; onArrive?: () => void; done?: boolean; key: string }
-interface Card { taskId: string; agent: WorkerId; tier: Tier; status: string; born: number }
+interface Card { taskId: string; step?: string; agent: WorkerId; tier: Tier; status: string; born: number }
 interface Stamp { verdict: Verdict; born: number }
 
 export interface Bubble { key: string; text: string; x: number; y: number; agent: string; at: number }
@@ -58,6 +82,7 @@ export class Office {
   private raf = 0;
   private last = performance.now();
   private bgHour = -1;
+  private usage = new Map<string, AgentUsage>();
   scale = 1;
   offX = 0; offY = 0;
   onLayout: () => void = () => {};
@@ -105,11 +130,26 @@ export class Office {
       case 'run_start': this.chairMode = 'thinking'; this.say('chair', 'Let me think about this…', CHAIR_DESK.x + 30, 40, 'chair'); break;
       case 'chair_text': this.chairMode = 'writing'; this.say('chair', firstSentence(e.text ?? ''), CHAIR_DESK.x + 30, 40, 'chair'); break;
       case 'chair_tool': this.chairMode = 'thinking'; break;
+      case 'plan': {
+        const steps = (e.data?.steps as { id: string; agent: WorkerId; tier: Tier }[]) ?? [];
+        // a revision replaces the steps that haven't been dispatched yet
+        this.cards = this.cards.filter((c) => c.status !== 'planned');
+        for (const st of steps) {
+          if (this.cards.some((c) => c.step === st.id)) continue;
+          this.cards.push({ taskId: `step:${st.id}`, step: st.id, agent: st.agent, tier: st.tier, status: 'planned', born: now });
+        }
+        while (this.cards.length > 16) this.cards.shift();
+        this.say('chair', `Plan: ${steps.length} step${steps.length === 1 ? '' : 's'}. Pinning them up.`, CHAIR_DESK.x + 30, 40, 'chair');
+        break;
+      }
       case 'dispatch': {
         const a = e.agent as WorkerId, tier = (e.tier ?? 0) as Tier;
         const desk = this.desks.get(`${a}:${tier}`)!;
         desk.model = e.model;
-        this.cards.push({ taskId: e.taskId!, agent: a, tier, status: 'working', born: now });
+        const stepId = e.data?.step as string | null | undefined;
+        const pinned = stepId ? this.cards.find((c) => c.step === stepId && c.status === 'planned') : undefined;
+        if (pinned) Object.assign(pinned, { taskId: e.taskId!, agent: a, tier, status: 'working', born: now });
+        else this.cards.push({ taskId: e.taskId!, step: stepId ?? undefined, agent: a, tier, status: 'working', born: now });
         if (this.cards.length > 16) this.cards.shift();
         this.chairMode = 'waiting';
         const dx = deskX(a, tier) + 13;
@@ -165,9 +205,16 @@ export class Office {
         if (e.verdict === 'accept' && card) { this.shelf.push(card.agent); if (this.shelf.length > 28) this.shelf.shift(); }
         break;
       }
+      case 'skill': this.sayFor(e.agent, `Skill: ${e.text ?? ''}`, e.tier as Tier | undefined); break;
       case 'run_done': this.chairMode = 'idle'; this.intray = 0; this.say('chair', 'Done. The answer is in the panel.', CHAIR_DESK.x + 30, 40, 'chair'); break;
       case 'run_error': this.chairMode = 'idle'; this.intray = 0; this.say('chair', 'That run stopped.', CHAIR_DESK.x + 30, 40, 'chair'); break;
     }
+  }
+
+  /** A skill being loaded shows as a speech bubble over whoever loaded it. */
+  private sayFor(agent: string, text: string, tier?: Tier) {
+    if (agent === 'chair') this.say('chair', text, CHAIR_DESK.x + 30, 40, 'chair');
+    else this.say(agent, text, deskX(agent as WorkerId, (tier ?? 0) as Tier) + 13, 149, agent);
   }
 
   private say(key: string, text: string, x: number, y: number, agent: string) {
@@ -231,6 +278,7 @@ export class Office {
     const ws = this.walkers.map((w) => ({ w, p: pos(w) })).sort((a, b) => a.p[1] - b.p[1]);
     for (const { w, p } of ws) this.drawWalker(g, w, p, now);
     this.drawStamps(g, now);
+    for (const t of TANKS) this.drawTanks(g, t, now);
 
     const c = this.ctx;
     c.imageSmoothingEnabled = false;
@@ -325,6 +373,14 @@ export class Office {
     this.cards.forEach((c, i) => {
       const x = bx + (i % 4) * 20, y = by + Math.floor(i / 4) * 13;
       const fresh = now - c.born < 400 && !this.reduced ? -1 : 0;
+      if (c.status === 'planned') {
+        g.fillStyle = 'rgba(239,234,224,0.18)'; g.fillRect(x, y, 16, 10);
+        g.fillStyle = AGENT_COLOR[c.agent];
+        for (let k = 0; k < 16; k += 2) { g.fillRect(x + k, y, 1, 1); g.fillRect(x + k, y + 9, 1, 1); }
+        for (let k = 0; k < 10; k += 2) { g.fillRect(x, y + k, 1, 1); g.fillRect(x + 15, y + k, 1, 1); }
+        for (let t = 0; t <= c.tier; t++) g.fillRect(x + 2 + t * 3, y + 6, 2, 2);
+        return;
+      }
       g.fillStyle = '#efeae0'; g.fillRect(x, y + fresh, 16, 10);
       g.fillStyle = AGENT_COLOR[c.agent]; g.fillRect(x, y + fresh, 16, 2);
       g.fillStyle = '#c8402f'; g.fillRect(x + 7, y - 1 + fresh, 2, 2);
@@ -374,6 +430,55 @@ export class Office {
       g.fillStyle = on ? '#5fd3a8' : '#24403a';
       g.fillRect(r.x + 9 + (i % 2) * 6, r.y + 82 + Math.floor(i / 2) * 9, 2, 1);
     }
+  }
+
+  setUsage(list: AgentUsage[]) { this.usage = new Map(list.map((u) => [u.agent, u])); }
+  usageFor(room: TankRoom) { return this.usage.get(TANK_SOURCE[room]); }
+
+  /** Two fuel tanks per office: liquid = share of the limit still left (5-hour left, weekly right). */
+  private drawTanks(g: CanvasRenderingContext2D, t: TankSpot, now: number) {
+    const u = this.usage.get(TANK_SOURCE[t.room]);
+    const col = AGENT_COLOR[t.room === 'chair' ? 'chair' : t.room];
+    const busy = [...this.desks.values()].some((d) => d.state === 'working' && (d.agent === t.room || (t.room === 'chair' && d.agent === 'claude')));
+    [u?.fiveHour, u?.weekly].forEach((w, i) => {
+      const x = t.x + i * TANK_GAP, y = t.y;
+      // stand + glass
+      g.fillStyle = '#2e2b28'; g.fillRect(x - 1, y + TANK_H, TANK_W + 2, 2);
+      g.fillStyle = '#8f887d'; g.fillRect(x, y - 1, TANK_W, 1); g.fillRect(x, y + TANK_H, TANK_W, 1);
+      g.fillRect(x - 1, y, 1, TANK_H); g.fillRect(x + TANK_W, y, 1, TANK_H);
+      g.fillStyle = '#161412'; g.fillRect(x, y, TANK_W, TANK_H);
+      if (!u || !u.available || !w) {
+        // no reading: an empty tank with a question mark
+        glyphs(g, '?', x + 2, y + 9, '#5f5a54');
+        return;
+      }
+      const left = Math.max(0, Math.min(100, 100 - w.usedPct));
+      const liquid = left <= 10 ? '#f2836e' : left <= 25 ? '#ecc94b' : col;
+      const h = Math.round((left / 100) * TANK_H);
+      const blinkOff = left <= 10 && !this.reduced && Math.floor(now / 450) % 2 === 0;
+      if (h > 0 && !blinkOff) {
+        g.fillStyle = shade(liquid, -0.25); g.fillRect(x, y + TANK_H - h, TANK_W, h);
+        g.fillStyle = liquid; g.fillRect(x + 1, y + TANK_H - h, TANK_W - 2, h);
+        // the surface ripples; bubbles rise while this office is working
+        const wave = this.reduced ? 0 : Math.floor(now / 300 + i * 2) % 3;
+        g.fillStyle = shade(liquid, 0.45); g.fillRect(x + wave, y + TANK_H - h, Math.min(3, TANK_W - wave), 1);
+        if (busy && !this.reduced && h > 4) {
+          for (let b = 0; b < 2; b++) {
+            const by = y + TANK_H - 2 - ((Math.floor(now / 90) + b * 9 + i * 5) % (h - 2));
+            g.fillStyle = shade(liquid, 0.6); g.fillRect(x + 2 + b * 3, by, 1, 1);
+          }
+        }
+      }
+      g.fillStyle = 'rgba(255,255,255,0.14)'; g.fillRect(x + 1, y + 1, 1, TANK_H - 2);   // glass shine
+      // gauge ticks every quarter
+      g.fillStyle = 'rgba(0,0,0,0.35)'; for (let q = 1; q < 4; q++) g.fillRect(x + TANK_W - 2, y + Math.round((TANK_H * q) / 4), 2, 1);
+      // readout above the tank: percent left
+      const txt = String(Math.round(left));
+      glyphs(g, txt, x + Math.floor((TANK_W - (txt.length * 4 - 1)) / 2), y - 8, left <= 25 ? liquid : '#d8d2c4');
+    });
+    // plates under the pair
+    glyphs(g, '5H', t.x + Math.floor((TANK_W - 7) / 2), t.y + TANK_H + 4, '#8f887d');
+    glyphs(g, 'WK', t.x + TANK_GAP + Math.floor((TANK_W - 7) / 2), t.y + TANK_H + 4, '#8f887d');
   }
 
   private drawStamps(g: CanvasRenderingContext2D, now: number) {
@@ -476,7 +581,7 @@ function drawBackground(g: CanvasRenderingContext2D, hour: number) {
   R(CHAIR_DESK.x + 22, CHAIR_DESK.y + 10, 16, 4, '#c9a26b'); R(CHAIR_DESK.x + 23, CHAIR_DESK.y + 11, 14, 2, '#8a6a4a');   // nameplate
   R(CHAIR_DESK.x + 2, CHAIR_DESK.y + 2, 12, 4, '#403b36'); R(INTRAY.x - 3, INTRAY.y + 1, 10, 6, '#403b36');                   // trays
   R(CHAIR_DESK.x + 46, CHAIR_DESK.y - 4, 2, 6, '#2e2b28'); R(CHAIR_DESK.x + 44, CHAIR_DESK.y - 6, 6, 2, '#f2a65a');            // lamp
-  plant(112, 92); plant(240, 92);
+  plant(112, 92);
 
   // ---- task board alcove
   R(12, 20, 88, 58, '#6b4c36'); R(14, 22, 84, 54, '#a4794f');
@@ -514,19 +619,16 @@ function drawBackground(g: CanvasRenderingContext2D, hour: number) {
   R(cx + 6, codex.y + 78, 16, 32, '#1c1a18'); R(cx + 7, codex.y + 79, 14, 30, '#272420');
   for (let i = 0; i < 3; i++) R(cx + 8, codex.y + 81 + i * 9, 12, 6, '#1c1a18');
   R(cx + 40, codex.y + 92, 40, 6, '#5f5a54'); R(cx + 40, codex.y + 98, 40, 5, '#46423d'); R(cx + 46, codex.y + 88, 10, 4, '#2e2b28'); R(cx + 64, codex.y + 89, 8, 3, '#5fd3a8');
-  plant(cx + 96, codex.y + 112);
   // antigravity studio: pedestal for the floating orb, easel
   const ax = antigravity.x;
   R(ax + 46, antigravity.y + 114, 12, 8, '#3a3550'); R(ax + 45, antigravity.y + 113, 14, 2, '#4d4670');
   R(ax + 10, antigravity.y + 80, 22, 18, '#efeae0'); R(ax + 12, antigravity.y + 82, 18, 14, '#d8d0f5'); R(ax + 15, antigravity.y + 86, 8, 6, '#a68cff'); R(ax + 20, antigravity.y + 98, 2, 14, '#6b4c36');
-  R(ax + 76, antigravity.y + 96, 26, 12, '#4d4670'); R(ax + 76, antigravity.y + 94, 26, 3, '#5f5788');
-  plant(ax + 96, antigravity.y + 112);
+  R(ax + 62, antigravity.y + 96, 24, 12, '#4d4670'); R(ax + 62, antigravity.y + 94, 24, 3, '#5f5788');
   // claude bullpen: couch + low table
   const lx = claude.x;
   R(lx + 10, claude.y + 96, 50, 14, '#8a6f52'); R(lx + 10, claude.y + 94, 50, 4, '#a3876a'); R(lx + 8, claude.y + 96, 4, 14, '#735b42'); R(lx + 58, claude.y + 96, 4, 14, '#735b42');
   R(lx + 22, claude.y + 116, 26, 6, '#5e4632'); R(lx + 26, claude.y + 114, 6, 3, '#efeae0');
-  R(lx + 74, claude.y + 84, 14, 16, '#4d3626'); for (let i = 0; i < 3; i++) R(lx + 76 + i * 4, claude.y + 86, 3, 12, books[i + 2]);
-  plant(lx + 96, claude.y + 112);
+  R(lx + 70, claude.y + 84, 14, 16, '#4d3626'); for (let i = 0; i < 3; i++) R(lx + 72 + i * 4, claude.y + 86, 3, 12, books[i + 2]);
 }
 
 function skyFor(hour: number): string[] {

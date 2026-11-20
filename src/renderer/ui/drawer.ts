@@ -1,8 +1,8 @@
-import { AlertTriangle, ArrowDownLeft, ArrowUpRight, Check, CornerUpLeft, PanelRightClose, Redo2, ShieldCheck, Terminal, TrendingUp } from 'lucide';
+import { AlertTriangle, ArrowDownLeft, ListChecks, ArrowUpRight, Check, CornerUpLeft, PanelRightClose, Redo2, ShieldCheck, Sparkles, Terminal, TrendingUp } from 'lucide';
 import type { WorkerId } from '../../shared/types.ts';
 import { clear, fmtSecs, fmtTokens, h, icon } from '../dom.ts';
 import { md } from '../md.ts';
-import { notify, state, subscribe, type Entry, type Task } from '../store.ts';
+import { notify, state, subscribe, type Entry, type Plan, type Task } from '../store.ts';
 import { AGENT_NAME } from './data.ts';
 import { shortModel, tierBadge } from './stage.ts';
 
@@ -13,11 +13,13 @@ const VERDICT_LABEL = { accept: 'Accepted', redo: 'Redo', escalate: 'Escalate', 
 export function mountDrawer(el: HTMLElement) {
   const tTranscript = h('button', { class: 'tab', role: 'tab', id: 'tab-transcript', 'aria-controls': 'feed' }, 'Transcript');
   const tTasks = h('button', { class: 'tab', role: 'tab', id: 'tab-tasks', 'aria-controls': 'feed' });
+  const tHandoff = h('button', { class: 'tab', role: 'tab', id: 'tab-handoff', 'aria-controls': 'feed', hidden: true }, 'Handoff');
   const collapse = h('button', { class: 'icon-btn', title: 'Hide side panel', 'aria-label': 'Hide side panel', onclick: () => document.getElementById('app')!.classList.add('drawer-collapsed') }, icon(PanelRightClose, 16));
   const feed = h('div', { class: 'feed', id: 'feed', role: 'tabpanel' });
-  el.append(h('div', { class: 'tabs', role: 'tablist' }, tTranscript, tTasks, h('span', { class: 'grow' }), collapse), feed);
+  el.append(h('div', { class: 'tabs', role: 'tablist' }, tTranscript, tTasks, tHandoff, h('span', { class: 'grow' }), collapse), feed);
   tTranscript.addEventListener('click', () => { state.drawerTab = 'transcript'; notify('drawer'); });
   tTasks.addEventListener('click', () => { state.drawerTab = 'tasks'; notify('drawer'); });
+  tHandoff.addEventListener('click', () => { state.drawerTab = 'handoff'; notify('drawer'); });
 
   let rendered = 0;          // transcript entries already in the DOM (append-only)
   const openOutputs = new Set<string>();
@@ -28,8 +30,26 @@ export function mountDrawer(el: HTMLElement) {
   const renderTabs = () => {
     tTranscript.setAttribute('aria-selected', String(state.drawerTab === 'transcript'));
     tTasks.setAttribute('aria-selected', String(state.drawerTab === 'tasks'));
+    tHandoff.hidden = !state.workerHandoff;
+    tHandoff.setAttribute('aria-selected', String(state.drawerTab === 'handoff'));
+    feed.setAttribute('aria-labelledby', `tab-${state.drawerTab}`);
     const n = state.tasks.size;
     clear(tTasks, 'Tasks', n ? h('span', { class: 'count num' }, String(n)) : null);
+  };
+
+  const renderHandoff = () => {
+    const { session, output } = state.workerHandoff!;
+    feed.dataset.view = 'handoff';
+    const head = h('div', { class: 'handoff-head', 'data-agent': session.agent },
+      who(session.agent, `${AGENT_NAME[session.agent]} · ${session.taskId.toUpperCase()}`, session.ts),
+      h('div', { class: 'handoff-meta' }, tierBadge(session),
+        h('span', { class: `verdict ${session.ok ? 'accept' : 'failed'}` }, session.ok ? 'Done' : 'Failed'),
+        h('span', { class: 'sid', title: session.sessionId }, session.sessionId.startsWith('handoff:') ? 'no session ID' : session.sessionId.slice(0, 8)),
+        h('button', { class: 'btn sm', onclick: () => { state.drawerTab = 'transcript'; notify('drawer'); } }, icon(CornerUpLeft, 13), 'Transcript')));
+    clear(feed, head,
+      output ? h('div', { class: 'prose handoff-output', html: md(output) }) : h('div', { class: 'feed-empty', role: 'status' },
+        output === undefined ? 'Loading handoff…' : output === null ? 'Handoff is unavailable.' : 'This handoff has no output.'));
+    feed.scrollTop = 0;
   };
 
   const renderTranscript = (full: boolean) => {
@@ -72,9 +92,10 @@ export function mountDrawer(el: HTMLElement) {
   subscribe((t) => {
     if (t === 'drawer') {
       renderTabs();
-      if (state.drawerTab === 'tasks') renderTasks(); else renderTranscript(true);
+      if (state.drawerTab === 'handoff') renderHandoff();
+      else if (state.drawerTab === 'tasks') renderTasks(); else renderTranscript(true);
     }
-    if (t === 'tasks') { renderTabs(); if (state.drawerTab === 'tasks') renderTasks(); }
+    if (t === 'tasks') { renderTabs(); if (state.drawerTab === 'tasks') renderTasks(); else if (state.drawerTab === 'transcript') refreshPlanCards(); }
     if (t === 'entries' && state.drawerTab === 'transcript') renderTranscript(false);
   });
   renderTabs(); renderTranscript(true);
@@ -129,11 +150,20 @@ function entry(e: Entry): HTMLElement {
         h('div', { class: 'foot num' },
           e.ms ? h('span', null, `Took ${fmtSecs(Math.round(e.ms / 1000))}`) : null,
           e.costUsd !== undefined ? h('span', null, `Chair $${e.costUsd.toFixed(3)}`) : null,
-          h('span', null, `${[...state.tasks.values()].filter((t) => t.runId === state.runId).length} delegated`)));
+          h('span', null, `${[...state.tasks.values()].filter((t) => t.runId === state.runId).length} delegated`),
+          skillsUsed().length ? h('span', { title: skillsUsed().join(', ') }, `${skillsUsed().length} skill${skillsUsed().length > 1 ? 's' : ''}: ${skillsUsed().join(', ')}`) : null));
     case 'error':
       return h('div', { class: 'e e-error', role: 'alert' }, e.text);
     case 'notice':
       return h('div', { class: 'e e-notice' }, e.text);
+    case 'plan':
+      return planCard(e.plan);
+    case 'skill': {
+      const t = e.taskId ? state.tasks.get(e.taskId) : undefined;
+      const who = e.agent === 'chair' ? 'Claude (chair)' : `${AGENT_NAME[e.agent]}${t ? ` · ${e.taskId}` : ''}`;
+      return h('div', { class: 'e e-skill', 'data-agent': e.agent }, icon(Sparkles, 13, 'ic'),
+        h('span', { class: 'skill-chip' }, e.name), h('span', { class: 'by' }, `loaded by ${who}`), h('time', { class: 'num' }, time(e.ts)));
+    }
   }
 }
 
@@ -164,10 +194,66 @@ function taskCard(t: Task, open: Set<string>) {
     h('div', { class: 'brief' }, t.brief),
     t.status === 'working' && t.live ? h('div', { class: 'live' }, t.live.slice(-700)) : null,
     t.status === 'working' && t.lastTool ? h('div', { class: 'tool' }, t.lastTool) : null,
+    t.skills.length ? h('div', { class: 'skills' }, icon(Sparkles, 12), t.skills.map((n) => h('span', { class: 'skill-chip' }, n))) : null,
     t.error ? h('div', { class: 'reason', style: 'color:var(--danger)' }, t.error) : null,
     t.reason ? h('div', { class: 'reason' }, t.reason) : null,
     details,
     h('div', { class: 'foot num' }, h('span', null, t.id), h('span', null, shortModel(t.model)), h('span', null, fmtSecs(elapsed)),
       t.tokens ? h('span', null, `${fmtTokens(t.tokens)} tok`) : null, t.costUsd ? h('span', null, `$${t.costUsd.toFixed(3)}`) : null,
       t.write ? null : h('span', null, 'read-only')));
+}
+
+/** Distinct skills loaded in this conversation, in first-use order. */
+function skillsUsed(): string[] {
+  return [...new Set(state.entries.filter((e): e is Extract<Entry, { kind: 'skill' }> => e.kind === 'skill').map((e) => e.name))];
+}
+
+// ---------------------------------------------------------------- plan card
+type StepStatus = 'planned' | Task['status'];
+const STEP_LABEL: Record<StepStatus, string> = {
+  planned: 'Planned', working: 'Working', returned: 'Awaiting review', failed: 'Failed', accept: 'Accepted', redo: 'Redo', escalate: 'Escalate',
+};
+
+/** A step's status is its latest task's (cross-checks don't count), or "planned" until dispatched. */
+function stepStatus(stepId: string): { status: StepStatus; task?: Task } {
+  const ts = [...state.tasks.values()].filter((t) => t.step === stepId && !t.checks);
+  const t = ts[ts.length - 1];
+  return t ? { status: t.status, task: t } : { status: 'planned' };
+}
+
+const planCards = new Map<HTMLElement, Plan>();
+
+function planCard(plan: Plan): HTMLElement {
+  const el = h('div', { class: 'e e-plan' });
+  planCards.set(el, plan);
+  fillPlan(el, plan);
+  return el;
+}
+
+function fillPlan(el: HTMLElement, plan: Plan) {
+  const latest = state.plan?.rev === plan.rev && state.plan.ts === plan.ts;
+  const done = plan.steps.filter((s) => stepStatus(s.id).status === 'accept').length;
+  clear(el,
+    h('div', { class: 'plan-head' }, icon(ListChecks, 15), h('span', { class: 't' }, plan.rev > 1 ? `Plan, revision ${plan.rev}` : 'Plan'),
+      h('span', { class: 'n num' }, latest ? `${done}/${plan.steps.length} accepted` : 'superseded'), h('time', { class: 'num' }, time(plan.ts))),
+    plan.summary ? h('div', { class: 'plan-sum' }, plan.summary) : null,
+    h('ol', { class: `plan-steps${latest ? '' : ' old'}` }, plan.steps.map((s) => {
+      const { status, task } = stepStatus(s.id);
+      return h('li', { class: `step ${status}`, 'data-agent': s.agent },
+        h('span', { class: 'sid num' }, s.id),
+        h('div', { class: 'body' },
+          h('div', { class: 'goal' }, s.goal),
+          h('div', { class: 'meta' }, h('span', { class: 'sw' }), AGENT_NAME[s.agent], tierBadge({ tier: s.tier, model: task?.model ?? '' }, true),
+            s.write ? null : h('span', null, 'read-only'),
+            s.depends_on?.length ? h('span', null, `after ${s.depends_on.join(', ')}`) : null),
+          h('div', { class: 'why' }, s.why)),
+        latest ? h('span', { class: `verdict ${status === 'planned' ? 'planned' : status}` }, STEP_LABEL[status]) : null);
+    })));
+}
+
+function refreshPlanCards() {
+  for (const [el, plan] of planCards) {
+    if (!el.isConnected) { planCards.delete(el); continue; }
+    fillPlan(el, plan);
+  }
 }

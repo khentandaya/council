@@ -1,8 +1,10 @@
 import { Check, ChevronDown, ChevronRight, FolderOpen, GitBranch, LogIn, Minus, PanelRight, RefreshCw, Square, SquarePen, UserPlus, X } from 'lucide';
 import iconUrl from '../../../resources/icon.png';
+import type { WorkerSession } from '../../shared/types.ts';
 import { basename, clear, h, icon, popover, relTime } from '../dom.ts';
 import { notify, resetConversation, state, subscribe } from '../store.ts';
-import { AGENT_NAME, refreshAccounts, refreshConfig, refreshConnections, refreshSessions } from './data.ts';
+import { shortModel, tierBadge } from './stage.ts';
+import { AGENT_NAME, refreshAccounts, refreshConfig, refreshConnections, refreshContext, refreshSessions, refreshUsage } from './data.ts';
 
 const api = window.council;
 
@@ -47,7 +49,7 @@ export function mountTitlebar(el: HTMLElement) {
         if (p.id === c.activeProfileId) return;
         state.config = await api.setConfig({ activeProfileId: p.id });
         notify('config');
-        refreshSessions(); refreshConnections();
+        refreshSessions(); refreshConnections(); refreshUsage(true);
       };
       return h('button', { class: 'menu-item', role: 'menuitem', disabled: state.running, onclick: pick },
         h('span', { class: `avatar${p.id === c.profiles[0].id ? '' : ' alt'}` }, initial(a?.email ?? p.name)),
@@ -79,7 +81,7 @@ export function mountTitlebar(el: HTMLElement) {
     if (perms) text = `Needs your OK (${perms})`;
     else if (state.running) {
       const s = Math.round((Date.now() - (state.runStartedAt ?? Date.now())) / 1000);
-      const phase = out ? `${out} task${out > 1 ? 's' : ''} out` : ({ thinking: 'Chair thinking', writing: 'Chair writing', waiting: 'Waiting on workers', reviewing: 'Chair reviewing', idle: 'Working' } as const)[state.chair];
+      const phase = out ? `${out} task${out > 1 ? 's' : ''} out` : ({ planning: 'Chair planning', thinking: 'Chair thinking', writing: 'Chair writing', waiting: 'Waiting on workers', reviewing: 'Chair reviewing', idle: 'Working' } as const)[state.chair];
       text = `${phase} · ${Math.floor(s / 60)}:${String(s % 60).padStart(2, '0')}`;
     }
     clear(status, h('span', { class: 'dot' }), h('span', { class: 'num' }, text));
@@ -113,6 +115,7 @@ async function switchFolder(folder: string, save: boolean) {
   if (save) state.config = await api.setConfig({ currentFolder: folder });
   await refreshConfig();
   state.resumeId = null; state.sessionTitle = null;
+  state.sessions = []; state.workerSessions = [];
   resetConversation();
   notify('config', 'run');
   refreshSessions(); refreshConnections();
@@ -121,10 +124,11 @@ async function switchFolder(folder: string, save: boolean) {
 const initial = (s: string) => (s.trim()[0] ?? '?').toUpperCase();
 
 export function mountSidebar(el: HTMLElement) {
-  const list = h('div', { class: 'session-list', role: 'list', 'aria-label': 'Sessions' });
+  const list = h('div', { role: 'list', 'aria-label': 'Sessions' });
+  const workers = h('details', { class: 'worker-sessions' });
   const newBtn = h('button', { class: 'icon-btn', title: 'New session', 'aria-label': 'New session', onclick: newSession }, icon(SquarePen, 16));
   const conns = h('details', { class: 'connections' });
-  el.append(h('div', { class: 'side-head' }, h('h2', null, 'Sessions'), newBtn), list, conns);
+  el.append(h('div', { class: 'side-head' }, h('h2', null, 'Sessions'), newBtn), h('div', { class: 'session-list' }, list, workers), conns);
 
   const renderSessions = () => {
     newBtn.disabled = state.running;
@@ -142,7 +146,33 @@ export function mountSidebar(el: HTMLElement) {
       title: s.title, onclick: () => openSession(s.sessionId, s.title),
     }, h('span', { class: 't' }, s.title),
       h('span', { class: 'm' }, h('span', { class: 'num' }, relTime(s.lastModified)),
-        s.gitBranch ? h('span', { class: 'branch' }, icon(GitBranch, 11), s.gitBranch) : null))));
+        s.gitBranch ? h('span', { class: 'branch' }, icon(GitBranch, 11), s.gitBranch) : null,
+        ctxGauge(s.sessionId === state.resumeId && state.context?.pct != null ? state.context.pct : s.contextPct, s.sessionId === state.resumeId && !!state.context?.exact)))));
+  };
+
+  const renderWorkers = () => {
+    workers.hidden = !state.config?.currentFolder;
+    const open = workers.open;
+    const shownId = state.drawerTab === 'handoff' ? state.workerHandoff?.session.sessionId : undefined;
+    const order = ['codex', 'antigravity', 'claude'] as const;
+    const groups = order.map((agent) => {
+      const sessions = state.workerSessions.filter((s) => s.agent === agent);
+      if (!sessions.length) return null;
+      return h('div', { class: 'worker-group', 'data-agent': agent },
+        h('div', { class: 'worker-agent' }, h('span', { class: 'sw' }), AGENT_NAME[agent], h('span', { class: 'num' }, String(sessions.length))),
+        sessions.map((s) => h('button', {
+          class: `session worker${s.sessionId === shownId ? ' active' : ''}`, title: `${s.taskId.toUpperCase()} · ${s.model} · ${new Date(s.ts).toLocaleString()}`,
+          onclick: () => openWorkerHandoff(s),
+        },
+          h('span', { class: 't' }, h('span', { class: 'task-id' }, s.taskId.toUpperCase()), shortModel(s.model)),
+          h('span', { class: 'm' }, tierBadge(s, true),
+            h('time', { class: 'num', datetime: new Date(s.ts).toISOString() }, relTime(s.ts)),
+            h('span', { class: `verdict ${s.ok ? 'accept' : 'failed'}` }, s.ok ? 'Done' : 'Failed')))));
+    });
+    clear(workers, h('summary', null, icon(ChevronRight, 14, 'chev'), 'Worker sessions',
+      h('span', { class: 'count num' }, String(state.workerSessions.length))),
+      state.workerSessions.length ? groups : h('div', { class: 'side-empty' }, 'No worker sessions in this folder yet.'));
+    workers.open = open;
   };
 
   const renderConns = () => {
@@ -158,10 +188,21 @@ export function mountSidebar(el: HTMLElement) {
   };
 
   subscribe((t) => {
-    if (t === 'sessions' || t === 'config' || t === 'run') renderSessions();
+    if (t === 'sessions' || t === 'config' || t === 'run' || t === 'context') renderSessions();
+    if (t === 'sessions' || t === 'config' || t === 'drawer') renderWorkers();
     if (t === 'connections') renderConns();
   });
-  renderSessions(); renderConns();
+  renderSessions(); renderWorkers(); renderConns();
+}
+
+async function openWorkerHandoff(session: WorkerSession) {
+  const view = { session, output: undefined as string | null | undefined };
+  state.workerHandoff = view;
+  state.drawerTab = 'handoff';
+  document.getElementById('app')!.classList.remove('drawer-collapsed');
+  notify('drawer');
+  view.output = await api.loadWorkerHandoff(session.sessionId).catch(() => null);
+  if (state.workerHandoff === view && state.drawerTab === 'handoff') notify('drawer');
 }
 
 function newSession() {
@@ -181,6 +222,16 @@ async function openSession(id: string, title: string) {
   state.entries.unshift({ kind: 'notice', text: msgs.length > 40 ? `Resuming session · showing last 40 of ${msgs.length} messages` : 'Resuming session', ts: Date.now() });
   state.drawerTab = 'transcript';
   notify('entries', 'sessions', 'run', 'drawer');
+  refreshContext();
 }
 
 export { newSession };
+
+/** Small context gauge for a session row: a 5-cell bar that warms as the window fills. */
+function ctxGauge(pct: number | undefined | null, exact: boolean) {
+  if (pct == null) return null;
+  const level = pct >= 80 ? 'hot' : pct >= 60 ? 'warm' : '';
+  return h('span', { class: `ctx-gauge ${level}`, title: `Context ${pct}% full${exact ? '' : ' (estimated from the last reply)'}` },
+    h('span', { class: 'cells', 'aria-hidden': 'true' }, [0, 1, 2, 3, 4].map((i) => h('i', { class: pct > i * 20 ? 'on' : '' }))),
+    h('span', { class: 'num' }, `${pct}%`));
+}

@@ -2,7 +2,7 @@ import { ArrowUp, Check, ChevronDown, ShieldAlert, Square } from 'lucide';
 import type { AgentId, WorkerId } from '../../shared/types.ts';
 import { clear, fmtTokens, h, icon, popover } from '../dom.ts';
 import { notify, state, subscribe, type Task } from '../store.ts';
-import { AGENT_NAME } from './data.ts';
+import { AGENT_NAME, refreshContext } from './data.ts';
 
 const api = window.council;
 const WORKERS: WorkerId[] = ['codex', 'antigravity', 'claude'];
@@ -35,7 +35,7 @@ export function mountLedger(el: HTMLElement) {
   const render = () => {
     const sp = state.spend.chair;
     const chairNow = !state.running ? (state.entries.length ? 'Ready for a follow-up' : 'Waiting for your prompt')
-      : ({ idle: 'Working', thinking: 'Thinking it through', writing: 'Writing', waiting: 'Waiting on workers', reviewing: 'Reviewing a return' } as const)[state.chair];
+      : ({ idle: 'Working', planning: 'Planning the work', thinking: 'Thinking it through', writing: 'Writing', waiting: 'Waiting on workers', reviewing: 'Reviewing a return' } as const)[state.chair];
     const allCost = sp.costUsd + state.spend.claude.costUsd;
     const sentBack = state.spend.codex.redo + state.spend.antigravity.redo + state.spend.claude.redo;
     const xchecks = [...state.tasks.values()].filter((t) => t.checks).length;
@@ -95,10 +95,17 @@ const EFFORTS = ['low', 'medium', 'high', 'xhigh'] as const;
 export function mountPromptbar(el: HTMLElement) {
   const ta = h('textarea', { rows: 1, 'aria-label': 'Prompt for the council', spellcheck: true });
   const chairChip = h('button', { class: 'chip', 'aria-haspopup': 'menu', title: 'Chair model and effort' });
-  const ctx = h('span', { class: 'hint' });
+  const planChip = h('button', { class: 'chip', onclick: async () => {
+    const c = state.config;
+    if (!c) return;
+    state.config = await api.setConfig({ pipeline: !c.pipeline });
+    notify('config');
+  } });
+  const ctx = h('span', { class: 'hint ctx-label' });
+  const meter = h('button', { class: 'ctx-meter', title: 'Context used by this chair session. Click to re-measure.', onclick: () => refreshContext() });
   const send = h('button', { class: 'btn primary send', 'aria-label': 'Send to the chair', title: 'Send (Enter)' }, icon(ArrowUp, 17));
   const stop = h('button', { class: 'btn send stop danger', title: 'Stop the run (Esc while typing here)', style: 'display:none' }, icon(Square, 12), 'Stop');
-  el.append(h('div', { class: 'composer' }, ta, h('div', { class: 'row' }, chairChip, ctx, h('span', { class: 'grow' }), h('span', { class: 'hint' }, h('span', { class: 'kbd' }, 'Shift'), '+', h('span', { class: 'kbd' }, 'Enter'), 'new line', h('span', { style: 'width:8px' }), h('span', { class: 'kbd' }, 'Ctrl'), '+', h('span', { class: 'kbd' }, 'K'), 'focus'), send, stop)));
+  el.append(h('div', { class: 'composer' }, ta, h('div', { class: 'row' }, chairChip, planChip, meter, ctx, h('span', { class: 'grow' }), h('span', { class: 'hint keys' }, h('span', { class: 'kbd' }, 'Shift'), '+', h('span', { class: 'kbd' }, 'Enter'), 'new line', h('span', { style: 'width:8px' }), h('span', { class: 'kbd' }, 'Ctrl'), '+', h('span', { class: 'kbd' }, 'K'), 'focus'), send, stop)));
 
   const grow = () => { ta.style.height = 'auto'; ta.style.height = `${Math.min(ta.scrollHeight, 200)}px`; };
   ta.addEventListener('input', () => { grow(); render(); });
@@ -144,9 +151,26 @@ export function mountPromptbar(el: HTMLElement) {
     send.style.display = state.running ? 'none' : '';
     stop.style.display = state.running ? '' : 'none';
     send.disabled = noFolder || !ta.value.trim();
+    planChip.disabled = !c;
+    planChip.textContent = c?.pipeline ? 'Plan first' : 'Plan: off';
+    planChip.setAttribute('aria-pressed', String(c?.pipeline ?? false));
     if (c) clear(chairChip, h('span', { class: 'sw' }), `Chair · ${c.chairModel[0].toUpperCase()}${c.chairModel.slice(1)} · ${c.chairEffort}`, icon(ChevronDown, 13));
     ctx.textContent = state.resumeId ? (state.sessionTitle ? `Continuing "${state.sessionTitle.slice(0, 48)}${state.sessionTitle.length > 48 ? '…' : ''}"` : 'Continuing this session') : 'New session';
   };
-  subscribe((t) => { if (t === 'config' || t === 'run' || t === 'sessions') render(); });
+  const renderMeter = () => {
+    const c = state.context;
+    meter.style.display = state.resumeId || c ? '' : 'none';
+    const pct = c?.pct ?? null;
+    const level = pct == null ? '' : pct >= 80 ? 'hot' : pct >= 60 ? 'warm' : '';
+    meter.className = `ctx-meter ${level}${c?.loading ? ' loading' : ''}`;
+    const label = pct != null ? `${pct}%` : c?.tokens ? `${fmtTokens(c.tokens)} tok` : c?.loading ? '…' : '–';
+    meter.title = c && pct != null
+      ? `Context ${pct}% full: ${fmtTokens(c.tokens)} of ${fmtTokens(c.max ?? 0)} tokens${c.model ? ` · ${c.model}` : ''}${c.exact ? '' : ' (live estimate)'}. Click to re-measure.`
+      : 'Context used by this chair session. Click to measure.';
+    clear(meter, h('span', { class: 'track', 'aria-hidden': 'true' }, h('span', { class: 'fill', style: `width:${pct ?? 0}%` })),
+      h('span', { class: 'num' }, 'Context ', h('b', null, label)));
+  };
+  subscribe((t) => { if (t === 'config' || t === 'run' || t === 'sessions') render(); if (t === 'context' || t === 'run') renderMeter(); });
+  renderMeter();
   render();
 }

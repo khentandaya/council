@@ -24,6 +24,15 @@ npm run dist       # builds dist\Council Setup <version>.exe
 
 ## How the council works
 
+Every prompt follows one pipeline, enforced in code (`src/main/chair.ts`):
+
+1. **Plan.** The chair reads just enough of the project and calls `submit_plan`: the steps, the worker and tier for each, and why. Workers refuse tasks until a plan exists.
+2. **Dispatch.** Each step goes to the worker the plan names. To hand a step to a different worker, the chair has to revise the plan first.
+3. **Review.** Every return gets a verdict, and risky work gets a read-only cross-check by a different agent.
+4. **Answer.** The run can't finish while planned steps are still undispatched.
+
+The chair never executes. It only has Read, Glob, Grep, web search/fetch and skills. Shell, edit and write tools are switched off, and a PreToolUse hook blocks anything else, even tools your own settings allow.
+
 - **Model ladder.** Tier 0 (trivial) uses haiku, gemini-3.8-flash-low, or codex effort low. Tier 1 uses sonnet, flash-high/neon, or codex medium. Tier 2 uses opus, argon/hydrogen-high, or codex high. The chair starts at the lowest plausible tier and escalates only after a failed review. In the office, each room has a T0, T1 and T2 desk, and the desk that lights up shows which tier is working.
 - **Review.** Every return gets a verdict: accept, redo, or escalate. For risky output, the chair asks a *different* agent to cross-check it read-only.
 - **Read-only vs write.** The chair marks each task. Codex runs with `-s read-only` or `-s workspace-write`. Antigravity runs in default mode (edits are refused) or `accept-edits`. Claude workers never get a shell.
